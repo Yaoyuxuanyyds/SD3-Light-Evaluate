@@ -1,2 +1,1 @@
-# REPA-SD3
-
+# SD3-Residual

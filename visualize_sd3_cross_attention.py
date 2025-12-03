@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
@@ -6,12 +5,10 @@ import os
 import math
 import argparse
 from dataclasses import dataclass
-from collections import defaultdict
 from typing import Dict, List, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
-import torchvision
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -21,15 +18,16 @@ from PIL import Image
 from diffusers.models.attention_processor import JointAttnProcessor2_0
 
 from sampler import StableDiffusion3Base  # must match your local sampler.py
-from transformer import SD3Transformer2DModel_REPA  # optional, only for type consistency
 
 
 # ========= Cross-attention capture =========
 
 @dataclass
 class AttentionRecord:
-    # cross_attn: [B, textLen, imageLen], already averaged across heads
-    cross_attn: torch.Tensor
+    # txt2img: [B, contextLen, imageLen], already averaged across heads
+    cross_txt2img: torch.Tensor
+    # img2txt: [B, imageLen, contextLen], already averaged across heads
+    cross_img2txt: torch.Tensor
 
 
 class CrossAttentionStore:
@@ -41,10 +39,19 @@ class CrossAttentionStore:
         self._records: Dict[int, AttentionRecord] = {}
         self.image_token_count: Optional[int] = None
 
-    def add(self, layer_idx: int, cross_attn: torch.Tensor, image_token_count: int):
+    def add(
+        self,
+        layer_idx: int,
+        cross_txt2img: torch.Tensor,
+        cross_img2txt: torch.Tensor,
+        image_token_count: int,
+    ):
         if self.image_token_count is None:
             self.image_token_count = image_token_count
-        self._records[layer_idx] = AttentionRecord(cross_attn.detach().cpu())
+        self._records[layer_idx] = AttentionRecord(
+            cross_txt2img=cross_txt2img.detach().cpu(),
+            cross_img2txt=cross_img2txt.detach().cpu(),
+        )
 
     def layers(self) -> Sequence[int]:
         return sorted(self._records.keys())
@@ -57,7 +64,9 @@ class JointAttentionRecorder(JointAttnProcessor2_0):
     """
     Wrap JointAttnProcessor2_0 to:
     - Perform the same attention math
-    - Record text->image cross attention
+    - Record
+        * text->image cross attention (txt2img)
+        * image->text cross attention (img2txt)
     - Average across heads (multi-head mean)
     """
 
@@ -113,12 +122,12 @@ class JointAttentionRecorder(JointAttnProcessor2_0):
             if attn.norm_added_k is not None:
                 enc_k = attn.norm_added_k(enc_k)
 
-            # concat image tokens + text tokens along sequence dim
+            # concat image tokens + context tokens along sequence dim
             query = torch.cat([query, enc_q], dim=2)
             key   = torch.cat([key,   enc_k], dim=2)
             value = torch.cat([value, enc_v], dim=2)
 
-            context_length = encoder_hidden_states.shape[1]  # textLen
+            context_length = encoder_hidden_states.shape[1]  # = contextLen
 
         scale = attn.scale
         if query.dtype != torch.float32:
@@ -152,15 +161,25 @@ class JointAttentionRecorder(JointAttnProcessor2_0):
         hidden_states_out = attn.to_out[0](hidden_states_out)
         hidden_states_out = attn.to_out[1](hidden_states_out)
 
-        # record cross-attention:
-        # We want: text queries -> image keys
-        # text queries start at index seq_len (after image tokens)
-        # image keys are in [:seq_len]
+        # ------------- record cross-attention -------------
         if encoder_hidden_states is not None and context_length > 0 and self.store is not None:
             image_tokens = seq_len
-            cross_slice = attn_probs[:, :, image_tokens:, :image_tokens]  # [B,H,textLen,imgLen]
-            cross_mean = cross_slice.mean(dim=1)  # average over heads => [B,textLen,imgLen]
-            self.store.add(self.layer_idx, cross_mean, image_tokens)
+            # txt2img: text queries (context) -> image keys
+            # shape: [B,H,contextLen,imgLen]
+            txt2img_slice = attn_probs[:, :, image_tokens: image_tokens + context_length, :image_tokens]
+            txt2img_mean = txt2img_slice.mean(dim=1)  # [B,contextLen,imgLen]
+
+            # img2txt: image queries -> text/context keys
+            # shape: [B,H,imgLen,contextLen]
+            img2txt_slice = attn_probs[:, :, :image_tokens, image_tokens: image_tokens + context_length]
+            img2txt_mean = img2txt_slice.mean(dim=1)  # [B,imgLen,contextLen]
+
+            self.store.add(
+                self.layer_idx,
+                cross_txt2img=txt2img_mean,
+                cross_img2txt=img2txt_mean,
+                image_token_count=image_tokens,
+            )
 
         if encoder_output is not None:
             return hidden_states_out, encoder_output
@@ -171,7 +190,7 @@ class JointAttentionRecorder(JointAttnProcessor2_0):
 def register_attention_recorders(denoiser_module, store: CrossAttentionStore, target_layers=None):
     """
     Inject JointAttentionRecorder into specified transformer blocks.
-    denoiser_module should be SD3Transformer2DModel_REPA (or wrapper with .base_model).
+    denoiser_module can be SD3Transformer2DModel_REPA or wrapper with .base_model.
     """
     base_model = getattr(denoiser_module, "base_model", denoiser_module)
     print(f"Total layers : {len(base_model.transformer_blocks)}")
@@ -208,7 +227,7 @@ def encode_image_to_latent(base: StableDiffusion3Base, img_tensor: torch.Tensor)
         img_tensor = img_tensor.to(dtype=vae.dtype)              # match fp16/fp32
         posterior = vae.encode(img_tensor * 2 - 1)               # map [0,1]->[-1,1]
         latent_pre = posterior.latent_dist.sample()              # [B,C,h,w]
-        z0 = (latent_pre - shift) * scaling                       # training latent space
+        z0 = (latent_pre - shift) * scaling                      # training latent space
     return z0  # [B,C,h,w]
 
 
@@ -229,17 +248,11 @@ def build_noisy_latent_like_training(
     B = clean_latent.shape[0]
 
     T = int(scheduler.config.num_train_timesteps)
-    # t is an integer timestep index [0, T)
-    # We create a batch tensor of that integer:
     t_tensor = torch.full((B,), timestep_idx, device=device, dtype=torch.long)
 
-    # interpolation ratio s \in [0,1]
     s = (t_tensor.float() / float(T)).view(B, 1, 1, 1)
 
-    # random noise endpoint x1
     x1 = torch.randn_like(clean_latent)
-
-    # linear blend in latent space
     x_s = (1.0 - s) * clean_latent + s * x1
 
     return x_s, t_tensor, timestep_idx
@@ -353,6 +366,9 @@ def run_single_step_and_visualize(
     alpha: float,
     cmap: str,
     seed: int,
+    residual_target_layers: Optional[List[int]] = None,
+    residual_origin_layer: Optional[int] = None,
+    residual_weights: Optional[List[float]] = None,
 ):
     os.makedirs(out_dir, exist_ok=True)
     torch.manual_seed(seed)
@@ -367,8 +383,7 @@ def run_single_step_and_visualize(
         dtype=dtype,
         use_8bit=False,
         load_ckpt_path=None,
-        load_transformer_only=False,
-        denoiser_override=None,
+        load_transformer_only=False
     )
     denoiser = base.denoiser
     denoiser.eval()
@@ -387,13 +402,10 @@ def run_single_step_and_visualize(
         clean_latent=z0,
         timestep_idx=timestep_idx,
     )
-    # z_t: [1,C,h_lat,w_lat]
-    # t_tensor: [1] long
-    # t_rawval: int, e.g. 500
 
-    # 5. encode prompt => prompt_emb (context embeddings), pooled_emb
+    # 5. encode prompt => prompt_emb (context embeddings), pooled_emb, token_mask
     with torch.no_grad():
-        prompt_emb, pooled_emb = base.encode_prompt([prompt], batch_size=1)
+        prompt_emb, pooled_emb, _ = base.encode_prompt([prompt], batch_size=1)
 
     # 6. get T5 tokens for labeling
     t5_inputs = base.tokenizer_3(
@@ -414,13 +426,32 @@ def run_single_step_and_visualize(
     total_context = prompt_emb.shape[1]         # clip_len + t5_len
     token_offset = total_context - t5_len       # = clip_len
 
+    # 选出“指定的文本 tokens”，后面 overlay 和 heatmap 都用这个列表
+    selected_tokens = []  # list of dicts: {word, tok_idx, tok_str}
+    for word in token_words:
+        matches = [
+            tok_idx for tok_idx in valid_token_idxs
+            if word in t5_tokens[tok_idx]
+        ]
+        if not matches:
+            print(f"[WARN] word '{word}' not found in first {len(valid_token_idxs)} valid T5 tokens")
+            continue
+        tok_idx = matches[0]
+        tok_str = t5_tokens[tok_idx]
+        selected_tokens.append(
+            {"word": word, "tok_idx": tok_idx, "tok_str": tok_str}
+        )
+
+    if not selected_tokens:
+        print("[WARN] No selected tokens found, nothing to visualize.")
+        return
+
     # 7. register attention recorders for chosen layers
     store = CrossAttentionStore()
     register_attention_recorders(denoiser, store, target_layers=layer_ids)
 
     # 8. forward once through denoiser
     with torch.no_grad():
-        # match dtype (fix fp16 mismatch)
         z_t         = z_t.to(dtype=denoiser.dtype)
         prompt_emb  = prompt_emb.to(dtype=denoiser.dtype)
         pooled_emb  = pooled_emb.to(dtype=denoiser.dtype)
@@ -431,22 +462,17 @@ def run_single_step_and_visualize(
             encoder_hidden_states=prompt_emb,
             pooled_projections=pooled_emb,
             return_dict=False,
+            residual_target_layers=residual_target_layers,
+            residual_origin_layer=residual_origin_layer,
+            residual_weights=residual_weights,
         )
 
     # after forward: store has head-averaged cross-attn per layer
 
-    # 9. for each requested token word, gather per-layer maps & save
-    for word in token_words:
-        # 找到第一个匹配该 word 的 T5 sub-token
-        matches = [
-            tok_idx for tok_idx in valid_token_idxs
-            if word in t5_tokens[tok_idx]
-        ]
-        if not matches:
-            print(f"[WARN] word '{word}' not found in first {len(valid_token_idxs)} valid T5 tokens")
-            continue
-        tok_idx = matches[0]
-        tok_str = t5_tokens[tok_idx]
+    # 9. 原有：对每个指定 token，画 txt→img 的 overlay
+    for sel in selected_tokens:
+        tok_idx = sel["tok_idx"]
+        tok_str = sel["tok_str"]
 
         layer_to_map: Dict[int, torch.Tensor] = {}
 
@@ -456,14 +482,13 @@ def run_single_step_and_visualize(
                 print(f"[WARN] no attention recorded for layer {layer_id}")
                 continue
 
-            # rec.cross_attn: [B,textLen,imageLen], B=1
-            # We want row = that token in the FULL text context
+            # rec.cross_txt2img: [B,contextLen,imageLen], B=1
             ctx_index = token_offset + tok_idx
-            if ctx_index >= rec.cross_attn.shape[1]:
+            if ctx_index >= rec.cross_txt2img.shape[1]:
                 print(f"[WARN] ctx_index {ctx_index} out of bounds for layer {layer_id}")
                 continue
 
-            token_map = rec.cross_attn[0, ctx_index]  # [imageLen]
+            token_map = rec.cross_txt2img[0, ctx_index]  # [imageLen]
             image_token_count = store.image_token_count
             grid_side = int(math.sqrt(image_token_count))
             if grid_side * grid_side != image_token_count:
@@ -491,6 +516,66 @@ def run_single_step_and_visualize(
                 alpha=alpha,
             )
             print(f"[SAVE] {grid_path}")
+
+    # 10. 新增：img→text 总注意力热力图
+    # 每一行：一层；每一列：一个 selected text token
+    layers_for_heatmap = [lid for lid in layer_ids if store.get(lid) is not None]
+    n_layers = len(layers_for_heatmap)
+    n_tokens = len(selected_tokens)
+
+    if n_layers > 0 and n_tokens > 0:
+        heat = np.zeros((n_layers, n_tokens), dtype=np.float32)
+
+        for i, layer_id in enumerate(layers_for_heatmap):
+            rec = store.get(layer_id)
+            # rec.cross_img2txt: [B,imgLen,contextLen]
+            img2txt = rec.cross_img2txt[0]  # [imgLen,contextLen]
+
+            # 对每个 text token，汇聚从所有 image tokens 来的注意力
+            # sum over imgLen dimension
+            summed = img2txt.sum(dim=0)  # [contextLen]
+
+            for j, sel in enumerate(selected_tokens):
+                ctx_index = token_offset + sel["tok_idx"]
+                if ctx_index >= summed.shape[0]:
+                    continue
+                heat[i, j] = float(summed[ctx_index].item())
+
+        # 为了可视化更稳定，对每一行做归一化（防止层间量级差太大）
+        row_max = heat.max(axis=1, keepdims=True)
+        row_max[row_max == 0] = 1.0
+        heat_norm = heat / row_max
+
+        fig, ax = plt.subplots(
+            figsize=(2 + n_tokens * 0.6, 2 + n_layers * 0.4)
+        )
+        im = ax.imshow(
+            heat_norm,
+            aspect="auto",
+            cmap=cmap,
+            origin="upper",
+        )
+        cbar = fig.colorbar(im, ax=ax, fraction=0.02, pad=0.02)
+        cbar.set_label("Relative img→text attention (per layer)", fontsize=10)
+
+        # x 轴：文本 token（列）
+        col_labels = [sanitize_token(sel["tok_str"]) for sel in selected_tokens]
+        ax.set_xticks(range(n_tokens))
+        ax.set_xticklabels(col_labels, rotation=60, ha="right", fontsize=8)
+
+        # y 轴：layer index（行）
+        ax.set_yticks(range(n_layers))
+        ax.set_yticklabels([str(l) for l in layers_for_heatmap], fontsize=8)
+
+        ax.set_xlabel("Text tokens", fontsize=10)
+        ax.set_ylabel("Layer index", fontsize=10)
+        ax.set_title("Total img→text attention per layer & token", fontsize=12)
+
+        fig.tight_layout()
+        heat_path = os.path.join(out_dir, f"img2text_token_heatmap_t{t_rawval}.png")
+        fig.savefig(heat_path, dpi=150)
+        plt.close(fig)
+        print(f"[SAVE] {heat_path}")
 
 
 # ========= CLI =========
@@ -534,6 +619,10 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0,
                         help="Noise seed for constructing x_s at timestep t.")
 
+    parser.add_argument("--residual_target_layers", type=int, nargs="+", default=None)
+    parser.add_argument("--residual_origin_layer", type=int, default=None)
+    parser.add_argument("--residual_weights", type=float, nargs="+", default=None)
+
     return parser.parse_args()
 
 
@@ -556,6 +645,9 @@ def main():
         alpha=args.alpha,
         cmap=args.cmap,
         seed=args.seed,
+        residual_target_layers=args.residual_target_layers,
+        residual_origin_layer=args.residual_origin_layer,
+        residual_weights=args.residual_weights,
     )
 
     print(f"[DONE] saved visualizations to {args.output}")

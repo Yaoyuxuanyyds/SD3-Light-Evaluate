@@ -12,7 +12,7 @@ IMGSIZE=1024
 BATCHSIZE=1
 
 
-SAVEDIR="/inspire/hdd/project/chineseculture/public/yuxuan/SD3-Residual/logs/generate/test2"
+SAVEDIR="/inspire/hdd/project/chineseculture/public/yuxuan/SD3-Residual/logs/generate/test"
 
 
 ### -----------------------------
@@ -23,7 +23,7 @@ RES_ORIGIN=1
 
 RES_TARGET="$(seq -s ' ' 4 13)"
 
-RES_WEIGHT="$(printf '0.0 %.0s' $(seq 4 13))"
+RES_WEIGHT="$(printf '0.05 %.0s' $(seq 4 13))"
 
 
 PROMPT="A man holds a letter stamped “Accepted” from his dream university, with his emotional response clearly visible."
@@ -56,9 +56,9 @@ python sample.py \
     --save_dir $FULL_SAVE_DIR \
     --save_name $SAVENAME \
     --prompt "$PROMPT" \
-    # --residual_target_layers $RES_TARGET \
-    # --residual_origin_layer $RES_ORIGIN \
-    # --residual_weights $RES_WEIGHT \
+    --residual_target_layers $RES_TARGET \
+    --residual_origin_layer $RES_ORIGIN \
+    --residual_weights $RES_WEIGHT \
 
 
 

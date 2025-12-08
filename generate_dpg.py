@@ -8,6 +8,7 @@ import torchvision.transforms as torch_transforms
 from PIL import Image
 
 from sampler import SD3Euler
+from lora_utils import *
 
 INTERPOLATIONS = {
     'bilinear': InterpolationMode.BILINEAR,
@@ -89,6 +90,14 @@ if __name__ == "__main__":
     # dpg bench prompt path
     parser.add_argument("--prompt_dir", type=str, default="/inspire/hdd/project/chineseculture/public/yuxuan/benches/ELLA/dpg_bench/prompts")
 
+    # ---------- LoRA 采样支持 ---------- #
+    parser.add_argument('--lora_ckpt', type=str, default=None, help='Path to LoRA-only checkpoint (.pth)')
+    parser.add_argument('--lora_rank', type=int, default=8)
+    parser.add_argument('--lora_alpha', type=int, default=16)
+    parser.add_argument('--lora_target', type=str, default='all_linear',
+                        help="all_linear 或模块名片段，如: to_q,to_k,to_v,to_out")
+    parser.add_argument('--lora_dropout', type=float, default=0.0)
+
 
     # residual
     parser.add_argument("--residual_target_layers", type=int, nargs="+", default=None)
@@ -119,6 +128,21 @@ if __name__ == "__main__":
         raise ValueError("Only sd3 is supported for this benchmark.")
     sampler = SD3Euler(use_8bit=False, load_ckpt_path=args.load_dir)
 
+    # ---------- 如果提供了 LoRA ckpt，注入 + 加载 ----------
+    if args.lora_ckpt is not None:
+        print(f"[LoRA] injecting & loading LoRA from: {args.lora_ckpt}")
+        target = "all_linear" if args.lora_target == "all_linear" else tuple(args.lora_target.split(","))
+        # 对 sampler.denoiser（SD3Transformer2DModel_Vanilla）里的 transformer 注入
+        denoiser = sampler.denoiser
+        inject_lora(denoiser, rank=args.lora_rank, alpha=args.lora_alpha,
+                    target=target, dropout=args.lora_dropout)
+        denoiser.to(device=device, dtype=torch.float32)   # 就地转换
+        lora_sd = torch.load(args.lora_ckpt, map_location="cpu")
+        load_lora_state_dict(denoiser, lora_sd, strict=True)
+        
+        sampler.denoiser.eval()
+        print("[LoRA] loaded and ready.")
+        
 
     sampler.denoiser.to(torch.float32)
     torch.set_default_dtype(torch.float32)

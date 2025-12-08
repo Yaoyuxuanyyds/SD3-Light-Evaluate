@@ -13,6 +13,7 @@ import tqdm
 from sampler import SD3Euler
 from dataset.datasets import get_target_dataset
 import json
+from lora_utils import *
 
 INTERPOLATIONS = {
     'bilinear': InterpolationMode.BILINEAR,
@@ -89,6 +90,15 @@ if __name__ == '__main__':
     parser.add_argument("--residual_weights", type=float, nargs="+", default=None)
 
 
+    # ---------- LoRA 采样支持 ---------- #
+    parser.add_argument('--lora_ckpt', type=str, default=None, help='Path to LoRA-only checkpoint (.pth)')
+    parser.add_argument('--lora_rank', type=int, default=8)
+    parser.add_argument('--lora_alpha', type=int, default=16)
+    parser.add_argument('--lora_target', type=str, default='all_linear',
+                        help="all_linear 或模块名片段，如: to_q,to_k,to_v,to_out")
+    parser.add_argument('--lora_dropout', type=float, default=0.0)
+
+
     args = parser.parse_args()
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -102,6 +112,20 @@ if __name__ == '__main__':
     else:
         raise ValueError('args.model should be one of [sd3, sdxl, sd1.5]')
 
+    # ---------- 如果提供了 LoRA ckpt，注入 + 加载 ----------
+    if args.lora_ckpt is not None:
+        print(f"[LoRA] injecting & loading LoRA from: {args.lora_ckpt}")
+        target = "all_linear" if args.lora_target == "all_linear" else tuple(args.lora_target.split(","))
+        # 对 sampler.denoiser（SD3Transformer2DModel_Vanilla）里的 transformer 注入
+        denoiser = sampler.denoiser
+        inject_lora(denoiser, rank=args.lora_rank, alpha=args.lora_alpha,
+                    target=target, dropout=args.lora_dropout)
+        denoiser.to(device=device, dtype=torch.float32)   # 就地转换
+        lora_sd = torch.load(args.lora_ckpt, map_location="cpu")
+        load_lora_state_dict(denoiser, lora_sd, strict=True)
+        
+        sampler.denoiser.eval()
+        print("[LoRA] loaded and ready.")
 
 
     # sample set

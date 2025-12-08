@@ -214,11 +214,13 @@ class StableDiffusion3Base():
             )['sample']
         return v
     
-    def predict_vector_residual(self, z, t, prompt_emb, pooled_emb, 
-            residual_target_layers: Optional[List[int]] = None,
-            residual_origin_layer: Optional[int] = None,
-            residual_weights: Optional[List[float]] = None,
-        ):
+    def predict_vector_residual(
+        self, z, t, prompt_emb, pooled_emb,
+        residual_target_layers: Optional[List[int]] = None,
+        residual_origin_layer: Optional[int] = None,
+        residual_weights: Optional[List[float]] = None,
+        residual_use_layernorm: bool = True,    # ⭐ 新增
+    ):
         with autocast('cuda', enabled=(self.dtype == torch.float16 and torch.cuda.is_available())):
             v = self.denoiser(
                 hidden_states=z,
@@ -228,7 +230,8 @@ class StableDiffusion3Base():
                 return_dict=False,
                 residual_target_layers=residual_target_layers,
                 residual_origin_layer=residual_origin_layer,
-                residual_weights=residual_weights
+                residual_weights=residual_weights,
+                residual_use_layernorm=residual_use_layernorm,   # ⭐ Forward 参数传递
             )['sample']
         return v
 
@@ -284,11 +287,18 @@ class SD3Euler(StableDiffusion3Base):
             img = self.decode(z)
         return img
     
-    def sample_residual(self, prompts: List[str], NFE: int, img_shape: Optional[Tuple[int]] = None, cfg_scale: float = 1.0, batch_size: int = 1, latent: Optional[torch.Tensor] = None,               
-            residual_target_layers: Optional[List[int]] = None,
-            residual_origin_layer: Optional[int] = None,
-            residual_weights: Optional[List[float]] = None,       
-        ):
+    def sample_residual(
+        self, prompts: List[str], NFE: int,
+        img_shape: Optional[Tuple[int]] = None,
+        cfg_scale: float = 1.0,
+        batch_size: int = 1,
+        latent: Optional[torch.Tensor] = None,
+
+        residual_target_layers: Optional[List[int]] = None,
+        residual_origin_layer: Optional[int] = None,
+        residual_weights: Optional[List[float]] = None,
+        residual_use_layernorm: bool = True,  # ⭐ 新增
+    ):
         imgH, imgW = img_shape if img_shape is not None else (1024, 1024)
         with torch.no_grad():
             prompt_emb, pooled_emb, _ = self.encode_prompt(prompts, batch_size)
@@ -302,15 +312,30 @@ class SD3Euler(StableDiffusion3Base):
         pbar = tqdm(timesteps, total=NFE, desc='SD3 Euler')
         for i, t in enumerate(pbar):
             timestep = t.expand(z.shape[0]).to(self.device)
-            pred_v = self.predict_vector_residual(z, timestep, prompt_emb, pooled_emb, 
+
+            pred_v = self.predict_vector_residual(
+                z, timestep, prompt_emb, pooled_emb,
                 residual_target_layers=residual_target_layers,
                 residual_origin_layer=residual_origin_layer,
-                residual_weights=residual_weights
-            )       
-            pred_null_v = self.predict_vector_residual(z, timestep, null_prompt_emb, null_pooled_emb, residual_target_layers=residual_target_layers, residual_origin_layer=residual_origin_layer, residual_weights=residual_weights) if cfg_scale != 1.0 else 0.0
+                residual_weights=residual_weights,
+                residual_use_layernorm=residual_use_layernorm,  # ⭐ 传递
+            )
+
+            pred_null_v = (
+                self.predict_vector_residual(
+                    z, timestep, null_prompt_emb, null_pooled_emb,
+                    residual_target_layers=residual_target_layers,
+                    residual_origin_layer=residual_origin_layer,
+                    residual_weights=residual_weights,
+                    residual_use_layernorm=residual_use_layernorm,  # ⭐ 传递
+                )
+                if cfg_scale != 1.0 else 0.0
+            )
+
             step = steps[i]
             step_next = steps[i + 1] if i + 1 < NFE else 0.0
             z = z + (step_next - step) * (pred_null_v + cfg_scale * (pred_v - pred_null_v))
+
         with torch.no_grad():
             img = self.decode(z)
         return img

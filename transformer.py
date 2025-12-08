@@ -15,6 +15,7 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 logger = logging.get_logger(__name__)
 
 
+
 class SD3Transformer2DModel_Residual(nn.Module):
     def __init__(self, base_model):
         super().__init__()
@@ -26,7 +27,7 @@ class SD3Transformer2DModel_Residual(nn.Module):
         return super().to(*args, **kwargs)
 
     # ===============================================================
-    #  新增：token-wise 标准化函数
+    #  token-wise 标准化
     # ===============================================================
     @staticmethod
     def _standardize_tokenwise(x, eps=1e-6):
@@ -35,33 +36,43 @@ class SD3Transformer2DModel_Residual(nn.Module):
         return (x - mean) / std, mean, std
 
     # ===============================================================
-    #  新增：带 LN + rescale/reshift 的 residual 函数
+    #  改进 residual（支持 stopgrad + 可选 LN）
     # ===============================================================
-    def _apply_residual_normed(self, target, origin, w):
+    def _apply_residual(
+        self,
+        target: torch.Tensor,
+        origin: torch.Tensor,
+        w: torch.Tensor,
+        use_layernorm: bool = True,
+    ):
         """
-        target: [B, L, D]
-        origin: [B, L, D]
+        target/origin: [B, L, D]
         w: scalar tensor
         """
-        # 标准化
-        t_norm, t_mean, t_std = self._standardize_tokenwise(target)
-        o_norm, _, _ = self._standardize_tokenwise(origin)
 
-        # 残差（支持负权重=自增强）
+        # ----------- STOP GRADIENT PART -----------
+        # residual 的 2 个输入都不参与梯度
+        target_nograd = target.detach()
+        origin_nograd = origin.detach()
+
+        # --- standardize ---
+        t_norm, t_mean, t_std = self._standardize_tokenwise(target_nograd)
+        o_norm, _, _ = self._standardize_tokenwise(origin_nograd)
+
+        # --- residual rule ---
         if w >= 0:
             mixed = t_norm + w * o_norm
         else:
-            mixed = t_norm * (1 - w)  # w=-0.25 → t_norm*1.25
+            mixed = t_norm * (1 - w)
 
-        # LayerNorm
-        mixed_ln = torch.nn.functional.layer_norm(
-            mixed,
-            normalized_shape=mixed.shape[-1:],
-            eps=1e-6,
-        )
+        # --- optional LN ---
+        if use_layernorm:
+            mixed = torch.nn.functional.layer_norm(
+                mixed, normalized_shape=mixed.shape[-1:], eps=1e-6
+            )
 
-        # 恢复 target 原本 scale + shift
-        return mixed_ln * t_std + t_mean
+        # --- restore original scale ---
+        return mixed * t_std + t_mean
 
 
     # ===============================================================
@@ -79,24 +90,25 @@ class SD3Transformer2DModel_Residual(nn.Module):
         skip_layers: Optional[List[int]] = None,
         output_hidden_states: bool = False,
 
-        # --- Residual 参数修改 ---
+        # --- residual 参数 ---
         residual_target_layers: Optional[List[int]] = None,
         residual_origin_layer: Optional[int] = None,
         residual_weights: Optional[Union[List[float], torch.Tensor]] = None,
+        residual_use_layernorm: bool = True,         # ⭐ 新增
     ) -> Union[torch.FloatTensor, Transformer2DModelOutput]:
 
         height, width = hidden_states.shape[-2:]
         hidden_states = self.base_model.pos_embed(hidden_states)
 
         temb = self.base_model.time_text_embed(timestep, pooled_projections)
-
         encoder_hidden_states = self.base_model.context_embedder(encoder_hidden_states)
+
         context_embedder_output = encoder_hidden_states
 
         img_hidden_states_list = []
         txt_hidden_states_list = []
 
-        # ------------------ residual 配置 -------------------------
+        # ---------------- residual config ----------------
         use_residual = (
             residual_origin_layer is not None
             and residual_target_layers is not None
@@ -104,49 +116,48 @@ class SD3Transformer2DModel_Residual(nn.Module):
         )
 
         if use_residual:
-            # 保证 residual_weights 是 tensor
             if isinstance(residual_weights, (list, tuple)):
                 residual_weights = torch.tensor(residual_weights, dtype=encoder_hidden_states.dtype)
             residual_weights = residual_weights.to(encoder_hidden_states.device)
 
-            # 保存每层进入前的 encoder_hidden_states
             pre_encoder_states = []
 
-        # ------------------ 开始循环 transformer blocks -------------------------
+        # ---------------- iterate transformer blocks ----------------
         for index_block, block in enumerate(self.base_model.transformer_blocks):
 
-            # 记录进入该层前的文本特征
             if use_residual:
                 pre_encoder_states.append(encoder_hidden_states)
 
-                # 是否是 residual target 层
                 if index_block in residual_target_layers:
                     tid = residual_target_layers.index(index_block)
                     w = residual_weights[tid]
 
+                    # pick origin state
                     if 0 <= residual_origin_layer < len(pre_encoder_states):
                         origin = pre_encoder_states[residual_origin_layer]
                     else:
                         raise ValueError(f"Invalid residual_origin_layer={residual_origin_layer}")
 
                     if origin.shape != encoder_hidden_states.shape:
-                        raise ValueError(f"Shape mismatch: origin={origin.shape}, target={encoder_hidden_states.shape}")
+                        raise ValueError(
+                            f"[Residual] Shape mismatch: origin={origin.shape} vs target={encoder_hidden_states.shape}"
+                        )
 
-                    # -------- 应用改进 residual --------
-                    encoder_hidden_states = self._apply_residual_normed(
+                    # --------- 改进版 residual 应用 ---------
+                    encoder_hidden_states = self._apply_residual(
                         encoder_hidden_states,
                         origin,
-                        w
+                        w,
+                        use_layernorm=residual_use_layernorm,
                     )
 
-            # optional skip
+            # ---------------- transformer compute ----------------
             is_skip = skip_layers is not None and index_block in skip_layers
 
-            # gradient checkpointing
             if torch.is_grad_enabled() and self.base_model.gradient_checkpointing and not is_skip:
                 def create_custom_forward(module, return_dict=None):
                     def custom_forward(*inputs):
-                        return module(*inputs, return_dict=return_dict) if return_dict is not None else module(*inputs)
+                        return module(*inputs)
                     return custom_forward
 
                 ckpt_kwargs = {}
@@ -162,12 +173,11 @@ class SD3Transformer2DModel_Residual(nn.Module):
                     joint_attention_kwargs=joint_attention_kwargs,
                 )
 
-
             if output_hidden_states:
                 img_hidden_states_list.append(hidden_states)
                 txt_hidden_states_list.append(encoder_hidden_states)
 
-        # ------------------ 输出部分保持不变 -------------------------
+        # -------------- output unchanged --------------
         hidden_states = self.base_model.norm_out(hidden_states, temb)
         hidden_states = self.base_model.proj_out(hidden_states)
 
@@ -190,13 +200,8 @@ class SD3Transformer2DModel_Residual(nn.Module):
                 "txt_hidden_states": txt_hidden_states_list,
                 "context_embedder_output": context_embedder_output,
             }
-        else:
-            return Transformer2DModelOutput(sample=output)
 
-
-
-
-
+        return Transformer2DModelOutput(sample=output)
 
 
 

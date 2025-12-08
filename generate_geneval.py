@@ -12,6 +12,7 @@ from torchvision.utils import save_image
 
 from sampler import SD3Euler
 from util import set_seed
+from lora_utils import *
 
 torch.set_grad_enabled(False)
 
@@ -24,11 +25,6 @@ class SD3ImageGenerator:
         self,
         model='sd3',
         load_dir=None,
-        lora_ckpt=None,
-        lora_rank=512,
-        lora_alpha=512,
-        lora_target="to_q,to_k,to_v,to_out",
-        lora_dropout=0.0,
         residual_target_layers=None,
         residual_origin_layer=None,
         residual_weights=None,
@@ -39,6 +35,7 @@ class SD3ImageGenerator:
             self.sampler = SD3Euler(use_8bit=False, load_ckpt_path=load_dir)
         else:
             raise ValueError('model should be sd3 only')
+
 
         # 保存 residual 参数
         self.residual_target_layers = residual_target_layers
@@ -91,7 +88,7 @@ class SD3ImageGenerator:
 # ============================================================
 # 参数解析（加入 world_size / rank）
 # ============================================================
-def parse_args():
+def parse_opt():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--metadata_file", type=str, required=True)
@@ -101,15 +98,24 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=16)
 
     # residual
-    parser.add_argument("--residual_target_layers", type=int, nargs="+", default=None)
+    parser.add_argument("--residual_target_layers", type=int, nopt="+", default=None)
     parser.add_argument("--residual_origin_layer", type=int, default=None)
-    parser.add_argument("--residual_weights", type=float, nargs="+", default=None)
+    parser.add_argument("--residual_weights", type=float, nopt="+", default=None)
+
+    # ---------- LoRA 采样支持 ---------- #
+    parser.add_argument('--lora_ckpt', type=str, default=None, help='Path to LoRA-only checkpoint (.pth)')
+    parser.add_argument('--lora_rank', type=int, default=8)
+    parser.add_argument('--lora_alpha', type=int, default=16)
+    parser.add_argument('--lora_target', type=str, default='all_linear',
+                        help="all_linear 或模块名片段，如: to_q,to_k,to_v,to_out")
+    parser.add_argument('--lora_dropout', type=float, default=0.0)
+
 
     # ===== 多 GPU 分片 =====
     parser.add_argument("--world_size", type=int, default=1)
     parser.add_argument("--rank", type=int, default=0)
 
-    return parser.parse_args()
+    return parser.parse_opt()
 
 
 # ============================================================
@@ -124,6 +130,8 @@ def main(opt):
 
     total_items = len(metadatas)
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
     # ===== 手动分片 =====
     if opt.world_size > 1:
         local_indices = [i for i in range(total_items) if i % opt.world_size == opt.rank]
@@ -145,6 +153,24 @@ def main(opt):
         residual_origin_layer=opt.residual_origin_layer,
         residual_weights=opt.residual_weights,
     )
+
+    # ---------- 如果提供了 LoRA ckpt，注入 + 加载 ----------
+    if opt.lora_ckpt is not None:
+        print(f"[LoRA] injecting & loading LoRA from: {opt.lora_ckpt}")
+        target = "all_linear" if opt.lora_target == "all_linear" else tuple(opt.lora_target.split(","))
+        # 对 sampler.denoiser（SD3Transformer2DModel_Vanilla）里的 transformer 注入
+        inject_lora(generator.sampler.denoiser, rank=opt.lora_rank, alpha=opt.lora_alpha,
+                    target=target, dropout=opt.lora_dropout)
+        generator.sampler.denoiser.to(device=device, dtype=torch.float32)   # 就地转换
+        lora_sd = torch.load(opt.lora_ckpt, map_location="cpu")
+        load_lora_state_dict(generator.sampler.denoiser, lora_sd, strict=True)
+        
+        generator.sampler.denoiser.eval()
+        print("[LoRA] loaded and ready.")
+        
+
+
+
 
     # ===== 遍历当前 rank 的 metadata =====
     for index in local_indices:
@@ -216,5 +242,5 @@ def main(opt):
 
 
 if __name__ == "__main__":
-    opt = parse_args()
+    opt = parse_opt()
     main(opt)

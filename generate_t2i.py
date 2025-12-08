@@ -10,6 +10,7 @@ from tqdm import tqdm
 from torchvision.transforms import ToTensor  # 其实现在没用到，但留着也无妨
 from sampler import SD3Euler
 from util import set_seed
+from lora_utils import *
 
 torch.set_grad_enabled(False)
 
@@ -147,6 +148,17 @@ def parse_args():
     parser.add_argument("--residual_origin_layer", type=int, default=None)
     parser.add_argument("--residual_weights", type=float, nargs="+", default=None)
 
+
+    # ---------- LoRA 采样支持 ---------- #
+    parser.add_argument('--lora_ckpt', type=str, default=None, help='Path to LoRA-only checkpoint (.pth)')
+    parser.add_argument('--lora_rank', type=int, default=8)
+    parser.add_argument('--lora_alpha', type=int, default=16)
+    parser.add_argument('--lora_target', type=str, default='all_linear',
+                        help="all_linear 或模块名片段，如: to_q,to_k,to_v,to_out")
+    parser.add_argument('--lora_dropout', type=float, default=0.0)
+
+
+
     # 多卡分片参数（仿照 DPG 脚本）
     parser.add_argument(
         "--world_size",
@@ -194,6 +206,25 @@ def main(opt):
         residual_origin_layer=opt.residual_origin_layer,
         residual_weights=opt.residual_weights,
     )
+
+
+    # ---------- 如果提供了 LoRA ckpt，注入 + 加载 ----------
+    if opt.lora_ckpt is not None:
+        print(f"[LoRA] injecting & loading LoRA from: {opt.lora_ckpt}")
+        target = "all_linear" if opt.lora_target == "all_linear" else tuple(opt.lora_target.split(","))
+        # 对 sampler.denoiser（SD3Transformer2DModel_Vanilla）里的 transformer 注入
+        inject_lora(generator.sampler.denoiser, rank=opt.lora_rank, alpha=opt.lora_alpha,
+                    target=target, dropout=opt.lora_dropout)
+        generator.sampler.denoiser.to(device=device, dtype=torch.float32)   # 就地转换
+        lora_sd = torch.load(opt.lora_ckpt, map_location="cpu")
+        load_lora_state_dict(generator.sampler.denoiser, lora_sd, strict=True)
+        
+        generator.sampler.denoiser.eval()
+        print("[LoRA] loaded and ready.")
+        
+
+
+
 
     # ========= 收集 txt 文件 =========
     txt_files = sorted(glob.glob(os.path.join(opt.dataset_dir, "*val.txt")))

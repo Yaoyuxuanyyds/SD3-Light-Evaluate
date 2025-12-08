@@ -530,7 +530,7 @@ def run_single_step_and_visualize(
             rec = store.get(layer_id)
             # rec.cross_img2txt: [B,imgLen,contextLen]
             img2txt = rec.cross_img2txt[0]  # [imgLen,contextLen]
-
+        
             # 对每个 text token，汇聚从所有 image tokens 来的注意力
             # sum over imgLen dimension
             summed = img2txt.sum(dim=0)  # [contextLen]

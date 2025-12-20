@@ -8,6 +8,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch import nn
 from torch.amp import autocast
 from util import set_seed
+from sd3_light import LightSD3Pipeline
 
 
 class StableDiffusion3Base():
@@ -18,51 +19,27 @@ class StableDiffusion3Base():
                  use_8bit=False,
                  load_ckpt_path: Optional[str] = None,
                  load_transformer_only: bool = False,
+                 sd3_variant: str = "sd3",
+                 ema_ckpt_path: Optional[str] = None,
                  ):
         
         self.device = device
         self.dtype = dtype
-        
-        keep_on_cpu = load_transformer_only
+        self.sd3_variant = sd3_variant.lower()
 
-        # 加载 8bit 模式或正常模式
-        if use_8bit:
-            print('[INFO] Load 8-bit encoder for text_encoder_3')
-            quant_config = BitsAndBytesConfig(load_in_8bit=True)
-            text_encoder_3 = T5EncoderModel.from_pretrained(
-                model_key,
-                subfolder='text_encoder_3',
-                quantization_config=quant_config,
-                torch_dtype=self.dtype,
-                device_map={"": "cuda:0"}
-            )
-            pipe = StableDiffusion3Pipeline.from_pretrained(
-                model_key,
-                text_encoder_3=text_encoder_3,
-                torch_dtype=self.dtype
-            )
-        else:
-            pipe = StableDiffusion3Pipeline.from_pretrained(
-                model_key,
-                torch_dtype=self.dtype,
-            )
+        if self.sd3_variant not in {"sd3", "light"}:
+            raise ValueError(f"Unsupported sd3_variant={sd3_variant}. Use 'sd3' or 'light'.")
 
-        # 加载本地 checkpoint（只加载 transformer；VAE/text_encoders 用预训练）
-        if load_ckpt_path is not None:
-            ckpt = torch.load(load_ckpt_path, map_location=device)
-            if 'transformer' not in ckpt:
-                raise KeyError(f"Checkpoint {load_ckpt_path} does not contain 'transformer' key.")
+        # 初始化 pipeline（标准 SD3 或 LightSD3）
+        pipe = self._load_diffusion_pipeline(
+            model_key=model_key,
+            use_8bit=use_8bit,
+            dtype=dtype,
+        )
 
-            # 目标 dtype：以 pipe.transformer 的参数 dtype 为准
-            tgt_dtype = next(pipe.transformer.parameters()).dtype
-            trans_sd = {k: v.to(dtype=tgt_dtype) for k, v in ckpt['transformer'].items()}
-
-            missing, unexpected = pipe.transformer.load_state_dict(trans_sd, strict=False)
-            print(f"[INFO] Loaded transformer from {load_ckpt_path}")
-            if missing:
-                print(f"[WARN] Missing keys when loading transformer: {missing}")
-            if unexpected:
-                print(f"[WARN] Unexpected keys when loading transformer: {unexpected}")
+        # 依次加载 checkpoint / EMA（仅 transformer）
+        self._load_transformer_checkpoint(pipe, load_ckpt_path, "transformer checkpoint")
+        self._load_transformer_checkpoint(pipe, ema_ckpt_path, "EMA weight")
         
         
 
@@ -94,6 +71,80 @@ class StableDiffusion3Base():
         )
 
         del pipe
+
+    def _load_diffusion_pipeline(self, model_key: str, use_8bit: bool, dtype: torch.dtype):
+        if self.sd3_variant == "light":
+            if use_8bit:
+                raise ValueError("use_8bit is not supported when sd3_variant='light'.")
+
+            light_pipe = LightSD3Pipeline.load_from_pretrained(
+                model_dir=model_key,
+                dtype=dtype,
+                transformer_dtype=dtype,
+                extra_model_config=None,
+            )
+            print(f"[INFO] Loaded LightSD3 pipeline from {model_key}")
+            return light_pipe.diffusers_pipeline
+
+        # 标准 SD3 路径
+        if use_8bit:
+            print('[INFO] Load 8-bit encoder for text_encoder_3')
+            quant_config = BitsAndBytesConfig(load_in_8bit=True)
+            text_encoder_3 = T5EncoderModel.from_pretrained(
+                model_key,
+                subfolder='text_encoder_3',
+                quantization_config=quant_config,
+                torch_dtype=self.dtype,
+                device_map={"": "cuda:0"}
+            )
+            pipe = StableDiffusion3Pipeline.from_pretrained(
+                model_key,
+                text_encoder_3=text_encoder_3,
+                torch_dtype=self.dtype
+            )
+        else:
+            pipe = StableDiffusion3Pipeline.from_pretrained(
+                model_key,
+                torch_dtype=self.dtype,
+            )
+        return pipe
+
+    @staticmethod
+    def _normalize_transformer_state_dict(raw_state: dict):
+        if raw_state is None or not isinstance(raw_state, dict) or len(raw_state) == 0:
+            return None
+
+        # unwrap common nesting
+        if "state_dict" in raw_state and isinstance(raw_state["state_dict"], dict):
+            raw_state = raw_state["state_dict"]
+
+        if "transformer" in raw_state and isinstance(raw_state["transformer"], dict):
+            raw_state = raw_state["transformer"]
+
+        if any(k.startswith("transformer.") for k in raw_state.keys()):
+            raw_state = {k[len("transformer."):]: v for k, v in raw_state.items() if k.startswith("transformer.")}
+
+        return raw_state
+
+    def _load_transformer_checkpoint(self, pipe, ckpt_path: Optional[str], desc: str):
+        if ckpt_path is None:
+            return
+
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        trans_sd = self._normalize_transformer_state_dict(ckpt)
+
+        if not trans_sd:
+            raise ValueError(f"Invalid {desc} at {ckpt_path}: no transformer weights found.")
+
+        tgt_dtype = next(pipe.transformer.parameters()).dtype
+        trans_sd = {k: v.to(dtype=tgt_dtype) for k, v in trans_sd.items()}
+
+        missing, unexpected = pipe.transformer.load_state_dict(trans_sd, strict=False)
+        print(f"[INFO] Loaded {desc} from {ckpt_path}")
+        if missing:
+            print(f"[WARN] Missing keys when loading {desc}: {missing}")
+        if unexpected:
+            print(f"[WARN] Unexpected keys when loading {desc}: {unexpected}")
 
     @torch.no_grad()
     def encode_prompt(self, prompt: List[str], batch_size: int = 1):
@@ -237,8 +288,25 @@ class StableDiffusion3Base():
 
 
 class SD3Euler(StableDiffusion3Base):
-    def __init__(self, model_key='/inspire/hdd/project/chineseculture/public/yuxuan/base_models/Diffusion/sd3', device='cuda', use_8bit=False, load_ckpt_path=None, load_transformer_only: bool = False):
-        super().__init__(model_key=model_key, device=device, use_8bit=use_8bit, load_ckpt_path=load_ckpt_path, load_transformer_only=load_transformer_only)
+    def __init__(
+        self,
+        model_key='/inspire/hdd/project/chineseculture/public/yuxuan/base_models/Diffusion/sd3',
+        device='cuda',
+        use_8bit=False,
+        load_ckpt_path=None,
+        load_transformer_only: bool = False,
+        sd3_variant: str = "sd3",
+        ema_ckpt_path: Optional[str] = None,
+    ):
+        super().__init__(
+            model_key=model_key,
+            device=device,
+            use_8bit=use_8bit,
+            load_ckpt_path=load_ckpt_path,
+            load_transformer_only=load_transformer_only,
+            sd3_variant=sd3_variant,
+            ema_ckpt_path=ema_ckpt_path,
+        )
 
     def inversion(self, src_img, prompts: List[str], NFE: int, cfg_scale: float = 1.0, batch_size: int = 1):
         prompt_emb, pooled_emb, _ = self.encode_prompt(prompts, batch_size)
@@ -339,4 +407,3 @@ class SD3Euler(StableDiffusion3Base):
         with torch.no_grad():
             img = self.decode(z)
         return img
-

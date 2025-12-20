@@ -26,6 +26,8 @@ class SD3ImageGenerator:
         residual_target_layers=None,
         residual_origin_layer=None,
         residual_weights=None,
+        sd3_variant="sd3",
+        ema_ckpt_path=None,
     ):
         """
         封装 sampler，支持普通 sample 和 sample_residual
@@ -36,7 +38,9 @@ class SD3ImageGenerator:
         self.sampler = SD3Euler(
             model_key,
             use_8bit=False,
-            load_ckpt_path=load_ckpt_path
+            load_ckpt_path=load_ckpt_path,
+            sd3_variant=sd3_variant,
+            ema_ckpt_path=ema_ckpt_path,
         )
 
         # residual 默认参数
@@ -142,6 +146,8 @@ def parse_args():
     )
 
     parser.add_argument("--output_prefix", type=str, default="sd3_multigpu")
+    parser.add_argument("--sd3_variant", type=str, default="sd3", choices=["sd3", "light"])
+    parser.add_argument("--ema_ckpt", type=str, default=None, help="Optional EMA transformer weight (only transformer)")
 
     # residual 参数
     parser.add_argument("--residual_target_layers", type=int, nargs="+", default=None)
@@ -205,6 +211,8 @@ def main(opt):
         residual_target_layers=opt.residual_target_layers,
         residual_origin_layer=opt.residual_origin_layer,
         residual_weights=opt.residual_weights,
+        sd3_variant=opt.sd3_variant,
+        ema_ckpt_path=opt.ema_ckpt,
     )
 
 

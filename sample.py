@@ -76,6 +76,9 @@ if __name__ == '__main__':
     parser.add_argument('--datadir', type=str, default='', help='data path')
     # model config
     parser.add_argument('--model', type=str, default='sd3', choices=['sd3', 'sdxl', 'sd1.5'], help='Model to use')
+    parser.add_argument('--model_key', type=str, default='/inspire/hdd/project/chineseculture/public/yuxuan/base_models/Diffusion/sd3', help='Path to SD3/LightSD3 pipeline directory')
+    parser.add_argument('--sd3_variant', type=str, default='sd3', choices=['sd3', 'light'], help='Use standard SD3 or LightSD3 checkpoint')
+    parser.add_argument('--ema_ckpt', type=str, default=None, help='Optional EMA transformer checkpoint path')
 
     # one sample generation
     parser.add_argument('--prompt', type=str, default="")
@@ -108,7 +111,13 @@ if __name__ == '__main__':
 
     # load model
     if args.model == 'sd3':
-        sampler = SD3Euler(use_8bit=False, load_ckpt_path=args.load_dir)
+        sampler = SD3Euler(
+            model_key=args.model_key,
+            use_8bit=False,
+            load_ckpt_path=args.load_dir,
+            sd3_variant=args.sd3_variant,
+            ema_ckpt_path=args.ema_ckpt,
+        )
     else:
         raise ValueError('args.model should be one of [sd3, sdxl, sd1.5]')
 

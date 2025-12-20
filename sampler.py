@@ -148,7 +148,7 @@ class StableDiffusion3Base():
         clip_mask = torch.logical_or(text_clip1_mask.bool(), text_clip2_mask.bool())  # [B,77]
         text_mask = torch.cat([clip_mask, text_t5_mask.bool()], dim=1)                # [B, 77+256]
 
-        return prompt_emb, pooled_prompt_emb, text_mask
+        return prompt_emb, pooled_prompt_emb, S
 
 
     def initialize_latent(self, img_size: Tuple[int], batch_size: int = 1):

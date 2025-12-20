@@ -184,6 +184,8 @@ def train(args):
         device=device,
         use_8bit=args.use_8bit,
         load_ckpt_path=None,
+        sd3_variant=args.sd3_variant,
+        ema_ckpt_path=args.ema_ckpt,
     )
     denoiser = sampler_model.denoiser
     denoiser.requires_grad_(False)
@@ -436,6 +438,9 @@ def main():
     # misc
     parser.add_argument("--froze_model", action="store_true")
 
+    parser.add_argument("--sd3_variant", type=str, default="sd3", choices=["sd3", "light"])
+    parser.add_argument("--ema_ckpt", type=str, default=None, help="Optional EMA transformer checkpoint")
+    
 
     parser.add_argument("--residual_target_layers", type=int, nargs="+", default=None)
     parser.add_argument("--residual_origin_layer", type=int, default=None)

@@ -25,14 +25,28 @@ class SD3ImageGenerator:
         self,
         model='sd3',
         load_dir=None,
+        model_key=None,
         residual_target_layers=None,
         residual_origin_layer=None,
         residual_weights=None,
+        sd3_variant="sd3",
+        ema_ckpt_path=None,
+        lora_ckpt=None,
+        lora_rank=None,
+        lora_alpha=None,
+        lora_target=None,
+        lora_dropout=None,
     ):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
         if model == 'sd3':
-            self.sampler = SD3Euler(use_8bit=False, load_ckpt_path=load_dir)
+            self.sampler = SD3Euler(
+                model_key=model_key,
+                use_8bit=False,
+                load_ckpt_path=load_dir,
+                sd3_variant=sd3_variant,
+                ema_ckpt_path=ema_ckpt_path,
+            )
         else:
             raise ValueError('model should be sd3 only')
 
@@ -96,11 +110,14 @@ def parse_opt():
     parser.add_argument("--n_samples", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--model_key", type=str, default="/inspire/hdd/project/chineseculture/public/yuxuan/base_models/Diffusion/sd3", help="Path to SD3/LightSD3 pipeline directory")
 
     # residual
     parser.add_argument("--residual_target_layers", type=int, nopt="+", default=None)
     parser.add_argument("--residual_origin_layer", type=int, default=None)
     parser.add_argument("--residual_weights", type=float, nopt="+", default=None)
+    parser.add_argument("--sd3_variant", type=str, default="sd3", choices=["sd3", "light"])
+    parser.add_argument("--ema_ckpt", type=str, default=None, help="Optional EMA transformer checkpoint")
 
     # ---------- LoRA 采样支持 ---------- #
     parser.add_argument('--lora_ckpt', type=str, default=None, help='Path to LoRA-only checkpoint (.pth)')
@@ -144,6 +161,7 @@ def main(opt):
     generator = SD3ImageGenerator(
         model='sd3',
         load_dir=None,
+        model_key=opt.model_key,
         lora_ckpt=opt.lora_ckpt,
         lora_rank=opt.lora_rank,
         lora_alpha=opt.lora_alpha,
@@ -152,6 +170,8 @@ def main(opt):
         residual_target_layers=opt.residual_target_layers,
         residual_origin_layer=opt.residual_origin_layer,
         residual_weights=opt.residual_weights,
+        sd3_variant=opt.sd3_variant,
+        ema_ckpt_path=opt.ema_ckpt,
     )
 
     # ---------- 如果提供了 LoRA ckpt，注入 + 加载 ----------

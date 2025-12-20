@@ -84,6 +84,9 @@ if __name__ == "__main__":
     parser.add_argument("--img_size", type=int, default=1024)
     
     parser.add_argument("--model", type=str, default="sd3")
+    parser.add_argument("--model_key", type=str, default="/inspire/hdd/project/chineseculture/public/yuxuan/base_models/Diffusion/sd3", help="Path to SD3/LightSD3 pipeline directory")
+    parser.add_argument("--sd3_variant", type=str, default="sd3", choices=["sd3", "light"])
+    parser.add_argument("--ema_ckpt", type=str, default=None, help="Optional EMA transformer checkpoint")
     parser.add_argument('--load_dir', type=str, default=None, help="replace it with your checkpoint")
     parser.add_argument("--save_dir", type=str, required=True)
 
@@ -126,7 +129,13 @@ if __name__ == "__main__":
     # load model
     if args.model != "sd3":
         raise ValueError("Only sd3 is supported for this benchmark.")
-    sampler = SD3Euler(use_8bit=False, load_ckpt_path=args.load_dir)
+    sampler = SD3Euler(
+        model_key=args.model_key,
+        use_8bit=False,
+        load_ckpt_path=args.load_dir,
+        sd3_variant=args.sd3_variant,
+        ema_ckpt_path=args.ema_ckpt,
+    )
 
     # ---------- 如果提供了 LoRA ckpt，注入 + 加载 ----------
     if args.lora_ckpt is not None:

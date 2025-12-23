@@ -7,7 +7,7 @@ from transformer import SD3Transformer2DModel_Vanilla, SD3Transformer2DModel_REP
 from torch.nn.parallel import DistributedDataParallel
 from torch import nn
 from torch.amp import autocast
-from util import set_seed
+# from util import set_seed
 from sd3_light import LightSD3Pipeline
 
 
@@ -199,7 +199,7 @@ class StableDiffusion3Base():
         clip_mask = torch.logical_or(text_clip1_mask.bool(), text_clip2_mask.bool())  # [B,77]
         text_mask = torch.cat([clip_mask, text_t5_mask.bool()], dim=1)                # [B, 77+256]
 
-        return prompt_emb, pooled_prompt_emb, S
+        return prompt_emb, pooled_prompt_emb, text_mask
 
 
     def initialize_latent(self, img_size: Tuple[int], batch_size: int = 1):

@@ -73,6 +73,8 @@ python sample.py \
 
 
 
+
+
 # A woman holding a Hello Kitty phone on her hands.
 
 # the word'START'written inchalk on asidewalk

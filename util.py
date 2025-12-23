@@ -268,7 +268,7 @@ def sample_timesteps(batch_size, num_steps, device, mode="uniform", **kwargs):
 
 
 import torch
-import torchaudio.functional as TAF
+# import torchaudio.functional as TAF
 
 import numpy as np
 from sklearn.cross_decomposition import CCA

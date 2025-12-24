@@ -21,7 +21,7 @@ PROMPT="A truck and a microwave."
 
 
 
-SAVENAME="sd3_light_pretrain-s2500"
+SAVENAME="sd3_light_pretrain-s10k"
 
 
 FULL_SAVE_DIR="${SAVEDIR}/${SAVENAME}"
@@ -41,8 +41,8 @@ python sample.py \
     --prompt "$PROMPT" \
     --save_dir $FULL_SAVE_DIR \
     --save_name $SAVENAME \
-    --model_key "/inspire/hdd/project/chineseculture/public/yuxuan/diffusion-pipe/outputs/sd3_light_pretrain/base-mmdit/20251220_01-28-57/step2500" \
-    # --ema_ckpt "/inspire/hdd/project/chineseculture/public/yuxuan/diffusion-pipe/outputs/sd3_light_pretrain/base-mmdit/20251220_01-28-57/step2500/ema_shadow.pt" \
+    --model_key "/inspire/hdd/project/chineseculture/public/yuxuan/diffusion-pipe/outputs/sd3_light_pretrain/base-mmdit/20251223_17-52-21/step10000" \
+    # --ema_ckpt "/inspire/hdd/project/chineseculture/public/yuxuan/diffusion-pipe/outputs/sd3_light_pretrain/base-mmdit/20251223_17-52-21/step10000/ema_shadow.pt" \
 
 
 

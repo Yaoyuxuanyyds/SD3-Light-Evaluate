@@ -462,7 +462,7 @@ class LightSD3Pipeline(BasePipeline):
         t5_prompt_embed = inputs["t5_prompt_embed"]
         mask = inputs["mask"]
 
-        uncond_dropout_enabled = self.model_config.get("enable_uncond_text_dropout", False)
+        uncond_dropout_enabled = False
         uncond_dropout_prob = self.model_config.get("uncond_text_dropout_prob", 0.464)
 
         if uncond_dropout_enabled and uncond_dropout_prob > 0:
